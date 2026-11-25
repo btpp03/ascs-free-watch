@@ -33,6 +33,10 @@ FREE_PRODUCT = "Micro Instances"
 FREE_OS = "Ubuntu 24.04 LTS"
 DEAD_STATUS = ("cancelled", "canceled", "failed", "error", "refunded", "expired")
 
+# 静默名单：这些订单只记日志/更新状态，不推 Telegram。
+# 用户 2026-11-25 要求：现有这台不要再通知，只在新免费实例可下单时推。
+MUTE_ORDERS = {"ORD-1795592770594"}
+
 STATE = "status.json"
 REPO = os.environ.get("GITHUB_REPOSITORY", "btpp03/ascs-free-watch")
 REPO_URL = "https://github.com/" + REPO
@@ -220,16 +224,23 @@ def main():
         old = seen.get(oid)
         if old != status:
             log("[asc] 订单 %s 状态 %s → %s" % (oid, old, status))
+            muted = oid in MUTE_ORDERS
             if status.lower() in DEAD_STATUS:
-                tg("🔴 <b>ASCS 免费订单失败/取消</b>\n订单：<code>%s</code> 状态：%s\n"
-                   "时间：%s（北京时间）" % (oid, status, bj()))
+                if muted:
+                    log("[asc] %s 在静默名单，跳过通知" % oid)
+                else:
+                    tg("🔴 <b>ASCS 免费订单失败/取消</b>\n订单：<code>%s</code> 状态：%s\n"
+                       "时间：%s（北京时间）" % (oid, status, bj()))
             elif old is not None and status.lower() in (
                     "active", "running", "provisioned", "fulfilled", "online"):
                 det = o.get("details") or {}
-                tg("🎉 <b>ASCS 免费容器开通了</b>\n订单：<code>%s</code> 状态：<b>%s</b>\n"
-                   "详情：<code>%s</code>\n面板：https://cloud.ascsonoway.com/my-servers/\n"
-                   "时间：%s（北京时间）"
-                   % (oid, status, json.dumps(det, ensure_ascii=False)[:400], bj()))
+                if muted:
+                    log("[asc] %s 在静默名单，跳过通知" % oid)
+                else:
+                    tg("🎉 <b>ASCS 免费容器开通了</b>\n订单：<code>%s</code> 状态：<b>%s</b>\n"
+                       "详情：<code>%s</code>\n面板：https://cloud.ascsonoway.com/my-servers/\n"
+                       "时间：%s（北京时间）"
+                       % (oid, status, json.dumps(det, ensure_ascii=False)[:400], bj()))
             seen[oid] = status
 
     # 30 天续期（keepalive_at 剩 < 5 天就点一次）
@@ -251,8 +262,11 @@ def main():
             log("[asc] 续期 %s → %s %s" % (o.get("id"), st, str(d)[:200]))
             if st == 200:
                 renewed[o.get("id")] = ka
-                tg("🔁 <b>ASCS 免费容器已自动续期 30 天</b>\n订单：<code>%s</code>\n"
-                   "时间：%s（北京时间）" % (o.get("id"), bj()))
+                if o.get("id") in MUTE_ORDERS:
+                    log("[asc] %s 在静默名单，续期不通知" % o.get("id"))
+                else:
+                    tg("🔁 <b>ASCS 免费容器已自动续期 30 天</b>\n订单：<code>%s</code>\n"
+                       "时间：%s（北京时间）" % (o.get("id"), bj()))
 
     # ---------- 3. 落盘 ----------
     new = {"pages": new_pages,
