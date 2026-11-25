@@ -24,10 +24,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 查免费档是否开窗
+      - name: 查开窗 / 自动下单 / 续期
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          ASCS_EMAIL: ${{ secrets.ASCS_EMAIL }}
+          ASCS_PASSWORD: ${{ secrets.ASCS_PASSWORD }}
         run: python3 watch.py
 
       - name: 保存状态
