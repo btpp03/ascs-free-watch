@@ -3,8 +3,8 @@ name: ascs-free-watch
 on:
   workflow_dispatch:
   schedule:
-    # 每 5 分钟（GitHub 原生 schedule 常丢 tick，主腿是 cron-job.org 外部 dispatch）
-    - cron: "*/5 * * * *"
+    # 每 15 分钟（GitHub 原生 schedule 常丢 tick，主腿是 cron-job.org 外部 dispatch）
+    - cron: "*/15 * * * *"
 
 permissions:
   contents: write
