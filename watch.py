@@ -101,18 +101,26 @@ def tg(text):
         return False
 
 
-def asc_login():
+def asc_login(retries=2):
     email = os.environ.get("ASCS_EMAIL", "").strip()
     pw = os.environ.get("ASCS_PASSWORD", "").strip()
     if not email or not pw:
         log("[asc] 未配置 ASCS_EMAIL/ASCS_PASSWORD，跳过账号侧动作")
         return None
-    st, d = http(BASE + "/api/auth/login", "POST",
-                 {"emailOrUsername": email, "password": pw})
-    if st == 200 and isinstance(d, dict) and d.get("token"):
-        log("[asc] 登录成功：%s" % d.get("email"))
-        return d["token"]
-    log("[asc] 登录失败：%s %s" % (st, str(d)[:200]))
+    for attempt in range(retries + 1):
+        st, d = http(BASE + "/api/auth/login", "POST",
+                     {"emailOrUsername": email, "password": pw})
+        if st == 200 and isinstance(d, dict) and d.get("token"):
+            log("[asc] 登录成功：%s" % d.get("email"))
+            return d["token"]
+        # 429 = 登录接口 10 次/15 分钟（per-account），退避后重试
+        if st == 429 and attempt < retries:
+            wait = 60 + attempt * 90
+            log("[asc] 登录被限流(429)，%ds 后重试" % wait)
+            time.sleep(wait)
+            continue
+        log("[asc] 登录失败：%s %s" % (st, str(d)[:200]))
+        return None
     return None
 
 
@@ -162,6 +170,13 @@ def main():
     live = [o for o in free_orders if str(o.get("status", "")).lower() not in DEAD_STATUS]
     log("[asc] 免费订单 %d 个（在途 %d）：%s"
         % (len(free_orders), len(live), [(o.get("id"), o.get("status")) for o in free_orders]))
+
+    if opened and not token:
+        key = "loginfail:%d" % int(time.time() // 3600)
+        if state.get("last_note_key") != key:
+            tg("🔴 <b>ASCS 开窗了，但脚本登录失败（可能被限流）</b>\n"
+               "请手动下单：%s\n时间：%s（北京时间）" % (opened[0][1], bj()))
+            state["last_note_key"] = key
 
     if opened and token:
         if live:
