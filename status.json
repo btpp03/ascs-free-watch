@@ -2,22 +2,18 @@
  "pages": {
   "micro": {
    "open": false,
-   "open_until": 1,
-   "checked": 1795592135
+   "open_until": 1
   },
   "micro_ab": {
    "open": false,
-   "open_until": 1794335418012,
-   "checked": 1795592135
+   "open_until": 1794335418012
   },
   "micro_na": {
    "open": false,
-   "open_until": 1,
-   "checked": 1795592135
+   "open_until": 1
   }
  },
  "catalog": {
   "e5-2660v3-free": "out_of_stock"
- },
- "checked_at": 1795592136
+ }
 }

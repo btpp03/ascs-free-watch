@@ -95,10 +95,10 @@ def main():
             html = get(url)
         except Exception as e:
             log("[%s] 抓取失败：%s（沿用上次状态）" % (key, e))
-            new_pages[key] = prev_pages.get(key, {"open": None})
+            new_pages[key] = dict(prev_pages.get(key) or {"open": None, "open_until": None})
             continue
         open_, val = parse_gate(html)
-        new_pages[key] = {"open": open_, "open_until": val, "checked": int(time.time())}
+        new_pages[key] = {"open": open_, "open_until": val}
         prev = (prev_pages.get(key) or {}).get("open")
         log("[%s] open=%s openUntil=%s (prev=%s)" % (key, open_, val, prev))
         if open_ is True and prev is not True:
@@ -147,13 +147,21 @@ def main():
             "时间：%s（北京时间）" % bj()
         )
 
-    st["pages"] = new_pages
-    st["catalog"] = prev_catalog
+    old = {"pages": prev_pages, "catalog": st.get("catalog") or {}}
+    new = {"pages": new_pages, "catalog": prev_catalog}
     if alerts or catalog_flip:
-        st["last_notify"] = int(time.time())
-    st["checked_at"] = int(time.time())
-    json.dump(st, open(STATE, "w"), ensure_ascii=False, indent=1)
-    log("state 已写回")
+        new["last_notify"] = int(time.time())
+    # 只有状态真的变了才落盘 → 仓库不会每跳一个提交
+    if json.dumps(old, sort_keys=True) != json.dumps(new, sort_keys=True) or \
+            st.get("last_notify") != new.get("last_notify"):
+        st["pages"] = new_pages
+        st["catalog"] = prev_catalog
+        if alerts or catalog_flip:
+            st["last_notify"] = int(time.time())
+        json.dump(st, open(STATE, "w"), ensure_ascii=False, indent=1)
+        log("state 有变化，已写回")
+    else:
+        log("state 无变化，不落盘（仓库不产生空提交）")
 
 
 if __name__ == "__main__":
