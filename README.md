@@ -1,6 +1,6 @@
 # ascs-free-watch
 
-盯 [ASCS Cloud（cloud.ascsonoway.com）](https://cloud.ascsonoway.com/vps-micro/) 的免费容器档：**开窗才推 Telegram，其余时间静默**。
+盯 [ASCS Cloud（cloud.ascsonoway.com）](https://cloud.ascsonoway.com/vps-micro/) 的免费容器档：**开窗就自动下单，然后推 Telegram；其余时间静默**。
 
 ## 为什么不是"查库存"
 
@@ -11,7 +11,7 @@ var openUntil = 1; // CLOSED 2026-11-25 by operator
 // restocked 2026-11-24: 80 units, E5 2650 v0 rig (.13)
 ```
 
-`openUntil` 是未来 epoch（或 0）＝开窗；`1` 或已过期 ＝ 关闭，而且服务器端同样拒绝免费订单。
+`openUntil` 是未来 epoch（或 0）＝开窗；`1` 或已过期 ＝ 关闭。
 **`/api/catalog` 不能当判据**：它只是快照，11-24 关窗后仍显示 `in_stock`，会误报（已经踩过）。
 
 ## 判据
@@ -23,7 +23,32 @@ var openUntil = 1; // CLOSED 2026-11-25 by operator
 | `/micro-instances-north-america/` | 内联 `var openUntil` |
 | `/game-servers/` 免费档 | 只能看目录 `e5-2660v3-free` 的 `stockStatus`，标注"需页面确认" |
 
-状态 `false → true` 才推；状态存 `status.json` 跟着仓库提交，避免重复推。
+## 自动下单（2026-11-25 实测可行）
+
+页面关窗时只是隐藏了按钮，**服务端并不拒单**：
+
+```bash
+POST /api/auth/login      {"emailOrUsername": "...", "password": "..."}   → token
+POST /api/create-checkout {"product":"Micro Instances","plan":"E5 2650 v0 Micro Free",
+                           "os":"Ubuntu 24.04 LTS","billing":"month",
+                           "addons":[],"promoCode":"","sshKey":""}       → {"free":true,"orderId":"ORD-..."}
+```
+
+实测关窗状态下照样返回 `{"free":true,"orderId":"ORD-1795592770594"}`，订单状态 `pending`（等开通）。
+⇒ 开窗一跳就能自己抢，不用人盯。
+
+**去重**：账号里只要有非 cancelled/failed 的免费订单就不再下单，避免重复。
+
+## 其他自动化
+
+- 到货：订单状态 `pending → active/running` 推一条（带 details）
+- 续期：`details.keepalive_at` 剩 < 5 天时 `POST /api/micro/keepalive/<订单号>` 自动续 30 天
+- 状态存 `status.json` 跟仓库提交，只在真变化时落盘（不产生空提交）
+
+## 没有 API key
+
+平台只有邮箱密码换 Bearer token（`ascs_auth_token`），没有 key 管理页/开发者页；
+所有面板操作都是同一套 REST（`/api/orders`、`/api/server/<订单号>/status`、`/api/micro/keepalive/<订单号>`）。
 
 ## 定时
 
@@ -40,5 +65,5 @@ var openUntil = 1; // CLOSED 2026-11-25 by operator
 ## 手动跑
 
 ```bash
-TG_BOT_TOKEN=... TG_CHAT_ID=... python3 watch.py
+ASCS_EMAIL=... ASCS_PASSWORD=... TG_BOT_TOKEN=... TG_CHAT_ID=... python3 watch.py
 ```

@@ -1,34 +1,42 @@
 #!/usr/bin/env python3
-"""ASCS Cloud (cloud.ascsonoway.com) 免费容器「开窗」盯梢。
+"""ASCS Cloud 免费容器：开窗自动下单 + 到货/续期通知。
 
-只做一件事：免费档从「关」变成「开」时推一条 Telegram，其余时间静默。
-状态存 status.json 跟仓库走，避免重复推送。
+流程（每 5 分钟一跳，cron-job.org 派发）：
+ 1. 抓 3 个下单页的内联 `var openUntil` 判断免费档是否开窗
+    （未来 epoch / 0 = 开；1 或已过期 = 关；/api/catalog 是快照，不可当判据）
+ 2. 开窗 + 账号里还没有在途免费订单 → 邮箱密码换 Bearer token，
+    直接 POST /api/create-checkout 下免费单（$0，不带任何收费 addon）
+ 3. 已有免费订单 → 盯状态，开通/失败各推一条
+ 4. keepalive_at 剩 < 5 天 → POST /api/micro/keepalive/<订单号> 自动续 30 天
 
-判据（2026-11-25 实测）：
-  页面免费卡片里的内联脚本有一个运营方开关
-      var openUntil = <int>;   // 1 = 关闭
-  逻辑 `if (openUntil && Date.now() >= openUntil) return;`
-  ⇒ openUntil 为 0 / null / 未来 epoch = 开；1 或已过期 epoch = 关。
-  ⚠️ /api/catalog 是快照，关窗后仍可能显示 in_stock（11-24 就踩过），不能当主判据。
+状态存 status.json 跟仓库走，只在真变化时落盘（不产生空提交）。
 """
 import json
 import os
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
+BASE = "https://cloud.ascsonoway.com"
 PAGES = {
-    "micro": ("https://cloud.ascsonoway.com/vps-micro/", "E5 2650 v0 免费容器（主下单页）"),
-    "micro_ab": ("https://cloud.ascsonoway.com/alberta-micro-instances/", "i5 3470 免费容器（Alberta 页）"),
-    "micro_na": ("https://cloud.ascsonoway.com/micro-instances-north-america/", "E5 2650 v0 免费容器（北美页）"),
+    "micro": (BASE + "/vps-micro/", "E5 2650 v0 免费容器（主下单页）"),
+    "micro_ab": (BASE + "/alberta-micro-instances/", "i5 3470 免费容器（Alberta 页）"),
+    "micro_na": (BASE + "/micro-instances-north-america/", "E5 2650 v0 免费容器（北美页）"),
 }
-CATALOG = "https://cloud.ascsonoway.com/api/catalog"
+CATALOG = BASE + "/api/catalog"
 GAME_FREE_PLAN = "e5-2660v3-free"
+
+FREE_PLAN = "E5 2650 v0 Micro Free"
+FREE_PRODUCT = "Micro Instances"
+FREE_OS = "Ubuntu 24.04 LTS"
+DEAD_STATUS = ("cancelled", "canceled", "failed", "error", "refunded", "expired")
+
 STATE = "status.json"
 REPO = os.environ.get("GITHUB_REPOSITORY", "btpp03/ascs-free-watch")
 REPO_URL = "https://github.com/" + REPO
-UA = {"User-Agent": "Mozilla/5.0 (compatible; ascs-free-watch/1.0)"}
+UA = {"User-Agent": "Mozilla/5.0 (compatible; ascs-free-watch/2.0)"}
 
 
 def log(*a):
@@ -39,10 +47,28 @@ def bj(ts=None):
     return time.strftime("%Y-%m-%d %H:%M", time.gmtime((ts or time.time()) + 8 * 3600))
 
 
-def get(url):
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode("utf-8", "replace")
+def http(url, method="GET", body=None, token=None, timeout=30):
+    headers = dict(UA)
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode()
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+            try:
+                return r.status, json.loads(raw)
+            except Exception:
+                return r.status, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, raw[:300]
 
 
 def parse_gate(html):
@@ -51,8 +77,7 @@ def parse_gate(html):
     if not m:
         return None, None
     val = int(m.group(1))
-    now_ms = time.time() * 1000
-    return (val == 0 or val > now_ms), val
+    return (val == 0 or val > time.time() * 1000), val
 
 
 def tg(text):
@@ -76,23 +101,49 @@ def tg(text):
         return False
 
 
-def load_state():
+def asc_login():
+    email = os.environ.get("ASCS_EMAIL", "").strip()
+    pw = os.environ.get("ASCS_PASSWORD", "").strip()
+    if not email or not pw:
+        log("[asc] 未配置 ASCS_EMAIL/ASCS_PASSWORD，跳过账号侧动作")
+        return None
+    st, d = http(BASE + "/api/auth/login", "POST",
+                 {"emailOrUsername": email, "password": pw})
+    if st == 200 and isinstance(d, dict) and d.get("token"):
+        log("[asc] 登录成功：%s" % d.get("email"))
+        return d["token"]
+    log("[asc] 登录失败：%s %s" % (st, str(d)[:200]))
+    return None
+
+
+def asc_orders(token):
+    st, d = http(BASE + "/api/orders", token=token)
+    if st == 200 and isinstance(d, list):
+        return d
+    log("[asc] 取订单失败：%s %s" % (st, str(d)[:200]))
+    return None
+
+
+def is_free_order(o):
     try:
-        return json.load(open(STATE))
+        return "free" in str(o.get("plan", "")).lower() or float(o.get("amount") or 0) == 0
     except Exception:
-        return {}
+        return False
 
 
 def main():
-    st = load_state()
-    prev_pages = st.get("pages") or {}
-    prev_catalog = st.get("catalog") or {}
-    new_pages = {}
-    alerts = []
+    st_old = json.load(open(STATE)) if os.path.exists(STATE) else {}
+    prev_pages = st_old.get("pages") or {}
+    state = dict(st_old)
 
+    # ---------- 1. 开窗判定 ----------
+    new_pages = {}
+    opened = []
     for key, (url, label) in PAGES.items():
         try:
-            html = get(url)
+            st, html = http(url)
+            if st != 200 or not isinstance(html, str):
+                raise RuntimeError("HTTP %s" % st)
         except Exception as e:
             log("[%s] 抓取失败：%s（沿用上次状态）" % (key, e))
             new_pages[key] = dict(prev_pages.get(key) or {"open": None, "open_until": None})
@@ -101,64 +152,124 @@ def main():
         new_pages[key] = {"open": open_, "open_until": val}
         prev = (prev_pages.get(key) or {}).get("open")
         log("[%s] open=%s openUntil=%s (prev=%s)" % (key, open_, val, prev))
-        if open_ is True and prev is not True:
-            alerts.append((label, url, val))
+        if open_ is True:
+            opened.append((label, url, val, prev))
 
-    # 游戏服免费档：页面没有 openUntil 开关，只能看目录库存（标注需人工确认）
-    catalog_flip = False
+    # ---------- 2. 账号侧：下单 / 到货 / 续期 ----------
+    token = asc_login()
+    orders = asc_orders(token) if token else None
+    free_orders = [o for o in (orders or []) if is_free_order(o)]
+    live = [o for o in free_orders if str(o.get("status", "")).lower() not in DEAD_STATUS]
+    log("[asc] 免费订单 %d 个（在途 %d）：%s"
+        % (len(free_orders), len(live), [(o.get("id"), o.get("status")) for o in free_orders]))
+
+    if opened and token:
+        if live:
+            o = live[0]
+            key = "dup:%s:%s" % (o.get("id"), o.get("status"))
+            if state.get("last_note_key") != key:
+                tg("🟡 <b>ASCS 免费档开窗了</b>，但账号里已有免费订单在途，没重复下单。\n"
+                   "订单：<code>%s</code> 状态：<b>%s</b>\n下单页：%s\n时间：%s（北京时间）"
+                   % (o.get("id"), o.get("status"), opened[0][1], bj()))
+                state["last_note_key"] = key
+            else:
+                log("[asc] 已有在途订单，跳过下单（不重复推送）")
+        else:
+            st, d = http(BASE + "/api/create-checkout", "POST", {
+                "product": FREE_PRODUCT, "plan": FREE_PLAN, "os": FREE_OS,
+                "billing": "month", "addons": [], "promoCode": "", "sshKey": "",
+            }, token=token, timeout=60)
+            log("[asc] 下单返回 %s %s" % (st, str(d)[:300]))
+            if st == 200 and isinstance(d, dict) and (d.get("free") or d.get("orderId")):
+                tg("🟢 <b>ASCS 免费容器已自动下单</b>\n"
+                   "订单：<code>%s</code>（$0，无 addon）\n"
+                   "规格：%s / %s\n"
+                   "状态：等待开通（站点高负载时会排队）\n"
+                   "面板：https://cloud.ascsonoway.com/my-servers/\n"
+                   "时间：%s（北京时间）\n仓库：%s"
+                   % (d.get("orderId"), FREE_PLAN, FREE_OS, bj(), REPO_URL))
+                orders = asc_orders(token) or []
+                free_orders = [o for o in orders if is_free_order(o)]
+                live = [o for o in free_orders
+                        if str(o.get("status", "")).lower() not in DEAD_STATUS]
+            else:
+                err = d.get("error") if isinstance(d, dict) else str(d)[:200]
+                tg("🔴 <b>ASCS 免费容器下单失败</b>\n返回：%s %s\n"
+                   "手动去试：https://cloud.ascsonoway.com/vps-micro/\n时间：%s（北京时间）"
+                   % (st, err, bj()))
+
+    # 到货 / 失败追踪
+    seen = state.get("order_status") or {}
+    for o in free_orders:
+        oid, status = o.get("id"), str(o.get("status", ""))
+        old = seen.get(oid)
+        if old != status:
+            log("[asc] 订单 %s 状态 %s → %s" % (oid, old, status))
+            if status.lower() in DEAD_STATUS:
+                tg("🔴 <b>ASCS 免费订单失败/取消</b>\n订单：<code>%s</code> 状态：%s\n"
+                   "时间：%s（北京时间）" % (oid, status, bj()))
+            elif old is not None and status.lower() in (
+                    "active", "running", "provisioned", "fulfilled", "online"):
+                det = o.get("details") or {}
+                tg("🎉 <b>ASCS 免费容器开通了</b>\n订单：<code>%s</code> 状态：<b>%s</b>\n"
+                   "详情：<code>%s</code>\n面板：https://cloud.ascsonoway.com/my-servers/\n"
+                   "时间：%s（北京时间）"
+                   % (oid, status, json.dumps(det, ensure_ascii=False)[:400], bj()))
+            seen[oid] = status
+
+    # 30 天续期（keepalive_at 剩 < 5 天就点一次）
+    renewed = state.get("renewed") or {}
+    for o in live:
+        det = o.get("details") or {}
+        ka = det.get("keepalive_at")
+        if not ka:
+            continue
+        try:
+            ts = time.mktime(time.strptime(ka[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+        except Exception:
+            continue
+        left = (ts + 30 * 86400 - time.time()) / 86400.0
+        log("[asc] %s keepalive_at=%s 剩余 %.1f 天" % (o.get("id"), ka, left))
+        if left < 5 and renewed.get(o.get("id")) != ka and token:
+            st, d = http(BASE + "/api/micro/keepalive/" + urllib.parse.quote(o.get("id")),
+                         "POST", {}, token=token)
+            log("[asc] 续期 %s → %s %s" % (o.get("id"), st, str(d)[:200]))
+            if st == 200:
+                renewed[o.get("id")] = ka
+                tg("🔁 <b>ASCS 免费容器已自动续期 30 天</b>\n订单：<code>%s</code>\n"
+                   "时间：%s（北京时间）" % (o.get("id"), bj()))
+
+    # ---------- 3. 落盘 ----------
+    new = {"pages": new_pages,
+           "catalog": dict(state.get("catalog") or {}),
+           "order_status": seen,
+           "renewed": renewed}
+    if state.get("last_note_key"):
+        new["last_note_key"] = state["last_note_key"]
+
+    # 游戏服免费档：只有目录信号（快照，仅作参考）
     try:
-        cat = json.loads(get(CATALOG))
+        st, cat = http(CATALOG)
         stock = None
-        for svc in cat.get("services", []):
-            for p in svc.get("plans", []):
+        for svc in (cat.get("services") or []):
+            for p in (svc.get("plans") or []):
                 if p.get("id") == GAME_FREE_PLAN:
                     stock = p.get("stockStatus")
-        log("[catalog] %s stock=%s (prev=%s) updatedAt=%s"
-            % (GAME_FREE_PLAN, stock, prev_catalog.get(GAME_FREE_PLAN), cat.get("updatedAt")))
-        if stock == "in_stock" and prev_catalog.get(GAME_FREE_PLAN) != "in_stock":
-            catalog_flip = True
         if stock:
-            prev_catalog[GAME_FREE_PLAN] = stock
+            prev = (state.get("catalog") or {}).get(GAME_FREE_PLAN)
+            new["catalog"][GAME_FREE_PLAN] = stock
+            log("[catalog] %s stock=%s (prev=%s)" % (GAME_FREE_PLAN, stock, prev))
+            if stock == "in_stock" and prev != "in_stock":
+                tg("🟡 <b>ASCS 游戏服免费档目录显示 in_stock</b>\n"
+                   "E5 2660v3 Free（1 vCPU / 2GB / 16GB + AMP）\n"
+                   "页面：https://cloud.ascsonoway.com/game-servers/\n"
+                   "⚠️ 目录是快照，需到页面确认\n时间：%s（北京时间）" % bj())
     except Exception as e:
-        log("[catalog] 抓取失败：%s" % e)
+        log("[catalog] 失败：%s" % e)
 
-    for label, url, val in alerts:
-        until = ""
-        if val and val > 1:
-            until = "\n窗口截止：%s（北京时间，页面 openUntil）" % bj(val / 1000)
-        tg(
-            "🟢 <b>ASCS 免费容器开窗了</b>\n"
-            "档位：%s\n"
-            "下单页：%s%s\n"
-            "规格：1 vCPU / 512MB / 16GB SSD，公网 IPv6，30 天手动续期\n"
-            "注册：邮箱即可，无卡无手机；Free 卡片点 Buy Now 直接下单\n"
-            "⚠️ 窗口很短（11-24 放 80 台，隔天就关），看到就马上下单\n"
-            "时间：%s（北京时间）\n仓库：%s"
-            % (label, url, until, bj(), REPO_URL)
-        )
-
-    if catalog_flip:
-        tg(
-            "🟡 <b>ASCS 游戏服免费档目录显示 in_stock</b>\n"
-            "E5 2660v3 Free（1 vCPU / 2GB / 16GB SSD，带 AMP 面板）\n"
-            "页面：https://cloud.ascsonoway.com/game-servers/\n"
-            "⚠️ 目录是快照，11-24 就出现过「目录 in_stock、页面实际已关」，"
-            "请到页面确认 Free 卡片能否点。\n"
-            "时间：%s（北京时间）" % bj()
-        )
-
-    old = {"pages": prev_pages, "catalog": st.get("catalog") or {}}
-    new = {"pages": new_pages, "catalog": prev_catalog}
-    if alerts or catalog_flip:
-        new["last_notify"] = int(time.time())
-    # 只有状态真的变了才落盘 → 仓库不会每跳一个提交
-    if json.dumps(old, sort_keys=True) != json.dumps(new, sort_keys=True) or \
-            st.get("last_notify") != new.get("last_notify"):
-        st["pages"] = new_pages
-        st["catalog"] = prev_catalog
-        if alerts or catalog_flip:
-            st["last_notify"] = int(time.time())
-        json.dump(st, open(STATE, "w"), ensure_ascii=False, indent=1)
+    if json.dumps(new, sort_keys=True) != json.dumps(
+            {k: st_old.get(k) for k in new}, sort_keys=True):
+        json.dump(new, open(STATE, "w"), ensure_ascii=False, indent=1)
         log("state 有变化，已写回")
     else:
         log("state 无变化，不落盘（仓库不产生空提交）")
