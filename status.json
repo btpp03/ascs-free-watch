@@ -17,8 +17,8 @@
   "e5-2660v3-free": "out_of_stock"
  },
  "order_status": {
-  "ORD-1795592770594": "pending"
+  "ORD-1795592770594": "active"
  },
  "renewed": {},
- "last_note_key": "loginfail:498796"
+ "last_note_key": "dup:ORD-1795592770594:active"
 }
