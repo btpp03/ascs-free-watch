@@ -35,7 +35,8 @@ DEAD_STATUS = ("cancelled", "canceled", "failed", "error", "refunded", "expired"
 
 # 静默名单：这些订单只记日志/更新状态，不推 Telegram。
 # 用户 2026-11-25 要求：现有这台不要再通知，只在新免费实例可下单时推。
-MUTE_ORDERS = {"ORD-1795592770594"}
+# 二号 ORD-1795670706982 由 probe2.py（5 分钟一跳）单独盯，这里静默避免重复推。
+MUTE_ORDERS = {"ORD-1795592770594", "ORD-1795670706982"}
 
 # 账号列表：(显示名, 邮箱环境变量, 密码环境变量)
 ACCOUNTS = [
