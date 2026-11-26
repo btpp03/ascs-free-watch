@@ -30,6 +30,8 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           ASCS_EMAIL: ${{ secrets.ASCS_EMAIL }}
           ASCS_PASSWORD: ${{ secrets.ASCS_PASSWORD }}
+          ASCS2_EMAIL: ${{ secrets.ASCS2_EMAIL }}
+          ASCS2_PASSWORD: ${{ secrets.ASCS2_PASSWORD }}
         run: python3 watch.py
 
       - name: 保存状态
